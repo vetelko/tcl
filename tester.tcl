@@ -43,6 +43,7 @@ proc db_eval {sql {show_sql 0}} {
 # not only for testing SQLite itself but for using it
 # store temporary data related to test
 proc db_init {} {
+	# ...
 	if {[file exists tester.sq3]} {
 		file delete tester.sq3
 	}
