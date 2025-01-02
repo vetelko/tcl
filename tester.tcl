@@ -9,7 +9,7 @@
 # } {wanted}
 proc test {name body wanted} {
 	if {$wanted eq {}} {
-		set wanted -noting-
+		set wanted -nothing-
 	}	
 	set got [eval $body]
 	set error_line [lindex [info frame -1] 3]
