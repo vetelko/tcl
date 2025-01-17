@@ -1,0 +1,316 @@
+#!/usr/bin/tclsh.docsrc
+#### Import of wapp.tcl
+INCLUDE wapp.tcl
+#### End of wapp.tcl
+
+# Generate all header content for the output document
+#
+proc search_header {} {
+  wapp {
+DOCHEAD {Search SQLite Documentation} {}
+  }
+}
+
+#-------------------------------------------------------------------------
+# Add an entry to the log database for the current query. Which 
+# returns $nRes results.
+#
+proc search_add_log_entry {nRes} {
+  if {[wapp-param-exists donotlog]} return
+  sqlite3 db2 [file dir [wapp-param SCRIPT_FILENAME]]/search.d/searchlog.db
+  db2 timeout 10000
+  set ip [wapp-param REMOTE_ADDR]
+  set query [wapp-param q]
+  db2 eval {
+    PRAGMA synchronous=OFF;
+    PRAGMA journal_mode=OFF;
+    BEGIN;
+      CREATE TABLE IF NOT EXISTS log(
+        ip,                  -- IP query was made from
+        query,               -- Fts5 query string
+        nres,                -- Number of results
+        timestamp DEFAULT CURRENT_TIMESTAMP
+      );
+      INSERT INTO log(ip, query, nres) VALUES($ip, $query, $nRes);
+    COMMIT;
+  }
+  db2 close
+}
+
+#-------------------------------------------------------------------------
+# This command is similar to the builtin Tcl [time] command, except that
+# it only ever runs the supplied script once. Also, instead of returning
+# a string like "xxx microseconds per iteration", it returns "x.yy ms" or
+# "x.yy s", depending on the magnitude of the time spent running the 
+# command. For example:
+#
+#   % ttime {after 1500}
+#   1.50 s
+#   % ttime {after 45}
+#   45.02 ms
+#
+proc ttime {script} {
+  set t [lindex [time [list uplevel $script]] 0]
+  if {$t>1000000} { return [format "%.2f s" [expr {$t/1000000.0}]] }
+  return [format "%.2f ms" [expr {$t/1000.0}]]
+}
+
+#-----------------------------------------------------------------------
+# Do a search of the change log
+#
+proc searchchanges {} {
+  set q [wapp-param q]
+  if {$q==""} {return {}}
+  if {[regexp -all \x22 $q] % 2} { append q \x22 }
+  set x ""
+  foreach word [split $q " "] {
+    append x " \"[string map [list "\"" "\"\""] $word]\""
+  }
+  set q [string trim $x]
+  regsub -all {[^a-zA-Z0-9_]} $q { } q
+  set open {<span style="background-color:#d9f2e6">}
+  set close {</span>}
+  set query {
+    SELECT url, version, idx, highlight(change, 3, $open, $close) AS text 
+    FROM change($q) ORDER BY rowid ASC
+  }
+  wapp-trim {
+    <p>Change log entries mentioning: <b>%html($q)</b>
+    <table border=0>
+  }
+  set s2 "style=\"margin-top:0\""
+  set s1 "style=\"font-size:larger; text-align:left\" class=nounderline"
+  set prev ""
+  db eval $query {
+    if {$prev!=$version} {
+      wapp-trim {
+        <tr> <td %unsafe($s1) valign=top> <a href='%url($url)'>%html($version)</a>
+        <td> <ul %unsafe($s2)>
+      }
+      set prev $version
+    }
+    wapp-subst {<li value=%html($idx)> (%html($idx)) %unsafe($text)\n}
+  }
+  wapp-trim {
+    </table>
+    <center><p>You can also see the <a href=changes.html>entire
+    changelog as a single page</a> if you wish.</center>
+  }
+}
+
+#-----------------------------------------------------------------------
+# Do a search over all documentation other than the change log
+#
+proc searchresults {} {
+  set q [wapp-param q]
+  if {$q==""} {return ""}
+
+  # Count the '"' characters in $::A(q). If there is an odd number of
+  # occurrences, add a " to the end of the query so that fts5 can parse
+  # it without error.
+  if {[regexp -all \x22 $q] % 2} { append q \x22 }
+
+  # Set iStart to the index of the first result to display. Results are
+  # indexed starting at zero from most to least relevant.
+  #
+  set iStart 0
+  catch {set iStart [expr {[wapp-param i 0]*10}]}
+
+  # Grab a list of rowid results.
+  #
+  set sql {
+    SELECT rowid FROM page WHERE page MATCH $q
+    ORDER BY srank(page) DESC,
+    rank * COALESCE(
+      (SELECT percent FROM weight WHERE id=page.rowid), 100
+    );
+  }
+  if {[catch { set lRowid [db eval $sql] }]} {
+    set x ""
+    foreach word [split $q " "] {
+      append x " \"[string map [list "\"" "\"\""] $word]\""
+    }
+    set q [string trim $x]
+    set lRowid [db eval $sql]
+  }
+
+  set lRes [list]
+  foreach rowid $lRowid {
+    if {$rowid > 1000} {
+      set parent [expr $rowid / 1000]
+      lappend subsections($parent) $rowid
+    } else {
+      lappend lRes $rowid
+    }
+  }
+
+  set nRes [llength $lRes]
+  set lRes [lrange $lRes $iStart [expr $iStart+9]]
+
+  # Add an entry to the log database.
+  #
+  search_add_log_entry $nRes
+
+  # If there are no results, return a message to that effect.
+  #
+  if {[llength $lRes] == 0} {
+    wapp-subst {<p>No Results for: <b>%html($q)</b>\n}
+  }
+  
+  # HTML markup used to highlight keywords within FTS5 generated snippets.
+  #
+  set open {<span style="background-color:#d9f2e6">}
+  set close {</span>}
+  set ellipsis {<b>&nbsp;...&nbsp;</b>}
+
+  # Grab the required data
+  #
+  db eval [string map [list %LIST% [join $lRowid ,]] {
+    SELECT 
+      rowid AS parentid, 
+      snippet(page, 0, $open, $close, $ellipsis, 6)  AS s_apis,
+      snippet(page, 2, $open, $close, '', 40)        AS s_title1,
+      snippet(page, 3, $open, $close, $ellipsis, 40) AS s_title2,
+      snippet(page, 4, $open, $close, $ellipsis, 40) AS s_content,
+      url, rank
+    FROM page($q)
+    WHERE rowid IN (%LIST%)
+  }] X {
+    foreach k [array names X] { set data($X(parentid),$k) [set X($k)] }
+  }
+
+  set i1 [expr {$iStart+1}]
+  set i2 [expr {($nRes < $iStart+10) ? $nRes : $iStart+10}]
+  wapp-trim {
+    <table border=0>
+    <p>Search results %html($i1)..%html($i2) of %html($nRes) for: <b>%html($q)</b>
+  }
+
+  foreach rowid $lRes {
+
+    foreach a {parentid s_apis s_title1 s_content url rank} {
+      set $a $data($rowid,$a)
+    }
+
+    if {[info exists subsections($parentid)]} {
+      set childid [lindex $subsections($parentid) 0]
+      set link $data($childid,url)
+      set hdr $data($childid,s_title2)
+
+      if {$hdr==""} {
+        set s_content ""
+      } else {
+        set s_content [subst {
+          <b><a style=color:#044a64 href=$link>$hdr</a></b>
+        }]
+      }
+
+      append s_content " $data($childid,s_content)"
+    }
+
+    wapp-trim {<tr>
+      <td valign=top style="line-height:150%">
+        <div style="white-space:wrap;font-size:larger" class=nounderline>
+          <a href="%url($url)">%unsafe($s_title1)</a> 
+          <div style="float:right;font-size:smaller;color:#BBB">(%url($url))</div>
+        </div>
+          <div style="margin-left: 10ex; font:larger monospace">%unsafe($s_apis)</div>
+        <div style="margin-left: 4ex; margin-bottom:1.5em">
+           %unsafe($s_content)
+        </div>
+      </td>
+    }
+  }
+  wapp-subst {</table>\n}
+
+
+  # If the query returned more than 10 results, add up to 10 links to 
+  # each set of 10 results (first link to results 1-10, second to 11-20, 
+  # third to 21-30, as required).
+  #
+  if {$nRes>10} {
+    set s(0) {border:solid #044a64 1px;padding:1ex;margin:1ex;line-height:300%;}
+    set s(1) "$s(0);background:#044a64;color:white"
+    wapp-subst {<center><p>\n}
+    for {set i 0} {$i < 10 && ($i*10)<$nRes} {incr i} {
+      set style $s([expr {($iStart/10)==$i}])
+      wapp-trim {
+        <a style="%html($style)"
+           href="search?q=%qp($q)&i=%qp($i)">%html([expr $i+1])</a>
+      }
+    }
+    wapp-subst {</center>\n}
+  }
+}
+
+# This is the main entry point into the search result page generator
+#
+proc wapp-default {} {
+  wapp-content-security-policy {default-src 'self' 'unsafe-inline'}
+  wapp-allow-xorigin-params
+  if {[wapp-param-exists env]} {
+    search_header
+    wapp-trim {
+      <h1>Environment Dump For Debugging</h1>
+      <pre>%html([wapp-debug-env])</pre>
+    }
+    return
+  }
+
+  # When running using the built-in webserver in Wapp (in other words,
+  # when not running as CGI) any filename that contains a "." loads
+  # directly from the filesystem.
+  if {[wapp-param WAPP_MODE]!="cgi"
+   && [string match *.* [wapp-param PATH_INFO]]
+  } {
+    set altfile [file dir [wapp-param SCRIPT_FILENAME]][wapp-param PATH_INFO]
+    set fd [open $altfile rb]
+    fconfigure $fd -translation binary
+    wapp-unsafe [read $fd]
+    close $fd
+    switch -glob -- $altfile {
+      *.html {
+        wapp-mimetype text/html
+      }
+      *.css {
+        wapp-mimetype text/css
+      }
+      *.gif {
+        wapp-mimetype image/gif
+      }
+    }
+    return
+  }
+
+  search_header
+  sqlite3 db [file dir [wapp-param SCRIPT_FILENAME]]/search.d/search.db
+  set searchType [wapp-param s d]
+  if {$searchType=="c"} {
+    set cmd searchchanges
+  } else {
+    set cmd searchresults
+  }
+  db transaction {
+    set t [ttime {$cmd}]
+  }
+  wapp-trim {
+    <center>
+    <p>Page generated by <a href='fts5.html'>FTS5</a> in about %html($t).
+    </center>
+    <script>
+      window.addEventListener('load', function() {
+        var w = document.getElementById("searchmenu");
+        w.style.display = "block";
+        w = document.getElementById("searchtype");
+        w.value = "%string($searchType)"
+        setTimeout(function(){
+          var s = document.getElementById("searchbox");
+          s.value = "%string([wapp-param q])"
+          s.focus();
+          s.select();
+        }, 30);
+      });
+    </script>
+  }
+}
+wapp-start $argv
